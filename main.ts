@@ -50,7 +50,7 @@ import {
 
 class ImportModal extends Modal {
 	plugin: InstanceType<typeof Plugin> & {
-		importCharacter: (url: string) => Promise<void>;
+		importCharacter: (url: string) => Promise<unknown>;
 		hpTracking: Map<string, { maxHp: number; currentHp: number; tempHp: number }>;
 	};
 	private urlValue = "";
@@ -2068,14 +2068,16 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 			return;
 		}
 		const failed: string[] = [];
+		let warning: string | undefined;
 		for (const { file, id } of characters) {
 			try {
-				await this.importCharacter(id, true);
+				warning = (await this.importCharacter(id, true)) ?? warning;
 			} catch (e) {
 				failed.push(file.basename);
 				console.error("[DnD Beyond Importer]", e);
 			}
 		}
+		if (warning) new Notice(`⚠️ ${warning}`, 7000);
 		const done = characters.length - failed.length;
 		new Notice(
 			failed.length
@@ -2088,8 +2090,8 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 	// Fetches a character from D&D Beyond, builds/updates its Markdown note, and
 	// refreshes charCache and the HP trackers. Re-throws on failure (after showing a
 	// Notice unless quiet) so callers — e.g. the refresh button on the sheet launcher —
-	// can detect and react to it.
-	async importCharacter(idOrUrl: string, quiet = false): Promise<void> {
+	// can detect and react to it. Resolves to any warning worth passing on.
+	async importCharacter(idOrUrl: string, quiet = false): Promise<string | undefined> {
 		const notify = (msg: string, ms: number) => {
 			if (!quiet) new Notice(msg, ms);
 		};
@@ -2100,10 +2102,12 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 		}
 
 		let data: DdbApiResponse;
+		let warning: string | undefined;
 		try {
 			const fetched = await this.ddb.fetchCharacter(id);
 			data = fetched.data;
-			if (fetched.warning) new Notice(`⚠️ ${fetched.warning}`, 7000);
+			warning = fetched.warning;
+			if (warning) notify(`⚠️ ${warning}`, 7000);
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			notify(`❌ ${msg}`, 8000);
@@ -2166,5 +2170,6 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 		this.notifyHpChanged(String(char.id));
 
 		notify(`✅ Imported ${char.name ?? "character"}.`, 3000);
+		return warning;
 	}
 }

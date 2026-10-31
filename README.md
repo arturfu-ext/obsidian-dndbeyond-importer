@@ -1,10 +1,23 @@
+> [!NOTE]
+> **This is a fork** of [DnD Beyond Importer](https://github.com/Webcreator3478/D-D-Beyond-Character-Importer---Obsidian-Plugin) by Jktaisa, published under its own plugin ID (`dndbeyond-sync`) so community updates can't overwrite it.
+>
+> What's different:
+> - **Refresh actually refreshes.** The HP tracker no longer sticks to a cached value, and open notes update straight away.
+> - **Private sheets work** with your D&D Beyond cookie, kept in Obsidian's secret storage and never in the vault.
+> - **Only real features appear.** D&D Beyond's internal pseudo-feats (Dark Bargain, Character Threads, Runestones, background ability scores) are gone, and class features are finally included.
+> - **Numbers match D&D Beyond** in more cases: Unarmored Defense, AC override and bonus boxes, Defense style, item modifiers only while in use, speed and initiative bonuses.
+> - **Tracker state and session notes survive a restart**, and the sheet has full data after one.
+> - **"Refresh all characters from D&D Beyond"** command for syncing the whole party.
+>
+> Moving from the original plugin: disable it first, because both register the same code blocks. Existing notes keep working. Set your output folder again in this plugin's settings.
+
 <div align="center">
 
 <img src="assets/banner.png" width="100%" alt="DnD Beyond Importer banner">
 
 # ⚔️ DnD Beyond Importer
 
-### Pull any public D&D Beyond character into Obsidian — formatted, queryable, and ready to roll.
+### Pull any D&D Beyond character into Obsidian — formatted, queryable, and ready to roll.
 
 <p>
 <img src="https://img.shields.io/github/stars/Webcreator3478/D-D-Beyond-Character-Importer---Obsidian-Plugin?style=for-the-badge&color=7C3AED">
@@ -88,7 +101,7 @@ Any of these input formats work:
 - Short URL — `https://www.dndbeyond.com/characters/137202151`
 - Bare ID — `137202151`
 
-> ⚠️ The character sheet must be set to **Public** on D&D Beyond. Private sheets can't be fetched.
+> **Private sheets:** log in to dndbeyond.com, open your browser's developer tools, copy the value of the `CobaltSession` cookie (under Application or Storage), and save it as a secret under **D&D Beyond cookie** in the plugin settings. **Test** shows which account it belongs to. The cookie logs in as you, so don't share it. It expires eventually; the plugin tells you when to replace it. Without a cookie, only sheets set to **Public** can be read.
 
 ### Interactive Character Sheet
 
