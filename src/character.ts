@@ -4,6 +4,9 @@ export interface DnDBeyondImporterSettings {
 	includeEquipment: boolean;
 	includeFeatures: boolean;
 	includeBackstory: boolean;
+	// Name of the Obsidian secret holding the CobaltSession cookie. The cookie itself
+	// lives in Obsidian's secret storage, never in data.json.
+	cobaltSecret: string;
 	// 5etools integration (disabled by default)
 	fiveEtoolsEnabled: boolean;
 	fiveEtoolsBaseUrl: string;
@@ -51,6 +54,7 @@ export interface DdbModifier {
 	type: string;
 	subType: string;
 	friendlySubtypeName?: string;
+	restriction?: string | null;
 	value?: number | null;
 	id?: number | string;
 	statId?: number | null;
@@ -120,6 +124,8 @@ export interface DdbRace {
 export interface DdbClass {
 	level?: number;
 	definition?: { name?: string };
+	classFeatures?: { definition?: DdbDefinition }[];
+	subclassDefinition?: { name?: string; classFeatures?: DdbDefinition[] } | null;
 	stats?: DdbStat[];
 	overrideStats?: DdbStat[];
 	bonusStats?: DdbStat[];
@@ -171,6 +177,8 @@ export interface DdbCharacter {
 	overrideHitPoints?: number;
 	removedHitPoints?: number;
 	temporaryHitPoints?: number;
+	deathSaves?: { successCount?: number | null; failCount?: number | null };
+	characterValues?: { typeId?: number; value?: number | string | null }[];
 	race?: DdbRace;
 	classes?: DdbClass[];
 	stats?: DdbStat[];
@@ -198,6 +206,7 @@ export const DEFAULT_SETTINGS: DnDBeyondImporterSettings = {
 	includeEquipment: true,
 	includeFeatures: true,
 	includeBackstory: true,
+	cobaltSecret: "",
 	fiveEtoolsEnabled: false,
 	fiveEtoolsBaseUrl: "https://5e.tools",
 };
@@ -239,8 +248,24 @@ export function getAllModifiers(char: DdbCharacter): DdbModifier[] {
 		...(char.modifiers?.race ?? []),
 		...(char.modifiers?.background ?? []),
 		...(char.modifiers?.feat ?? []),
-		...(char.modifiers?.item ?? []),
+		...getActiveItemModifiers(char),
 	];
+}
+
+// An item's modifiers only count while it's in use, which modifiers.item doesn't
+// tell us, so read them off the inventory instead.
+function getActiveItemModifiers(char: DdbCharacter): DdbModifier[] {
+	const mods: DdbModifier[] = [];
+	for (const item of char.inventory ?? []) {
+		const def = item.definition;
+		if (!def?.grantedModifiers) continue;
+		const active =
+			(!def.canEquip && !def.canAttune && !def.isConsumable) ||
+			(item.isAttuned && (item.equipped || !def.canEquip)) ||
+			(!def.canAttune && item.equipped);
+		if (active) mods.push(...def.grantedModifiers);
+	}
+	return mods;
 }
 
 // Advantage/disadvantage on a saving throw or skill check. Checks both the
@@ -296,9 +321,11 @@ export function calcLevel(classes: DdbClass[]): number {
 }
 
 export function calcAC(char: DdbCharacter, dexScore: number, allStats: Record<number, number>, allMods: DdbModifier[]): number {
+	// characterValues typeId 1 is the "override AC" box on the sheet.
+	const override = (char.characterValues ?? []).find((v) => v.typeId === 1 && v.value != null);
+	if (override) return Number(override.value);
+
 	const dexMod = Math.floor((dexScore - 10) / 2);
-	const conMod = Math.floor(((allStats[3] ?? 10) - 10) / 2);
-	const wisMod = Math.floor(((allStats[5] ?? 10) - 10) / 2);
 	let bestAC = 10 + dexMod;
 	let shieldBonus = 0;
 	let wearingArmor = false;
@@ -317,24 +344,147 @@ export function calcAC(char: DdbCharacter, dexScore: number, allStats: Record<nu
 			}
 		}
 	}
-	// Unarmored defense: Barbarian (10+DEX+CON), Monk (10+DEX+WIS).
-	// Shields are NOT armor (armorTypeId 4 is tracked separately as shieldBonus), so
-	// wearingArmor stays false when only a shield is equipped — allowing unarmored
-	// defense to apply. The shield bonus is still added at the end either way.
+	// Unarmored Defense and friends. Shields are NOT armor (armorTypeId 4 is tracked
+	// separately as shieldBonus), so wearingArmor stays false when only a shield is
+	// equipped. statId names the extra ability (Barbarian CON, Monk WIS); fixed-value
+	// grants (Draconic Resilience) use value instead.
 	if (!wearingArmor) {
 		for (const m of allMods) {
-			if (m.subType === "unarmored-defense-constitution")
-				bestAC = Math.max(bestAC, 10 + dexMod + conMod);
-			if (m.subType === "unarmored-defense-wisdom")
-				bestAC = Math.max(bestAC, 10 + dexMod + wisMod);
+			if (m.type !== "set" || m.subType !== "unarmored-armor-class" || m.isGranted === false) continue;
+			const extra = m.statId != null ? Math.floor(((allStats[m.statId] ?? 10) - 10) / 2) : (m.value ?? 0);
+			bestAC = Math.max(bestAC, 10 + dexMod + extra);
 		}
 	}
-	// Flat AC bonuses: Defense fighting style (+1), feats, magic items, etc.
 	for (const m of allMods) {
-		if (m.type === "bonus" && m.subType === "armor-class" && m.value != null)
-			bestAC += m.value;
+		if (m.type !== "bonus" || m.value == null) continue;
+		// Flat AC bonuses: feats, magic items, etc.
+		if (m.subType === "armor-class") bestAC += m.value;
+		// Defense fighting style applies only in armor.
+		if (m.subType === "armored-armor-class" && wearingArmor) bestAC += m.value;
+		if (m.subType === "unarmored-armor-class" && !wearingArmor) bestAC += m.value;
+	}
+	// characterValues typeId 2 and 3 are the sheet's magic and misc AC bonus boxes.
+	for (const v of char.characterValues ?? []) {
+		if (v.typeId === 2 || v.typeId === 3) bestAC += Number(v.value ?? 0);
 	}
 	return bestAC + shieldBonus;
+}
+
+export function calcSpeed(char: DdbCharacter, allMods: DdbModifier[]): number {
+	let speed = char.race?.weightSpeeds?.normal?.walk ?? 30;
+	const worn = (char.inventory ?? []).filter((i) => i.equipped && i.definition?.armorClass);
+	const inHeavyArmor = worn.some((i) => i.definition?.armorTypeId === 3);
+	const unarmored = worn.length === 0;
+	for (const m of allMods) {
+		if (m.type === "set" && m.subType === "innate-speed-walking") speed = Math.max(speed, m.value ?? 0);
+	}
+	for (const m of allMods) {
+		if (m.type !== "bonus") continue;
+		// Restrictions are free text. The only common one on a speed bonus is Fast
+		// Movement's "not in heavy armor"; anything else we can't evaluate is skipped.
+		const applies = !m.restriction || (/heavy armor/i.test(m.restriction) && !inHeavyArmor);
+		if (applies && (m.subType === "speed" || m.subType === "speed-walking")) speed += m.value ?? 0;
+		if (m.subType === "unarmored-movement" && unarmored) speed += m.value ?? 0;
+	}
+	return speed;
+}
+
+export function calcInitiative(dexScore: number, allStats: Record<number, number>, allMods: DdbModifier[]): number {
+	let init = Math.floor((dexScore - 10) / 2);
+	for (const m of allMods) {
+		if (m.type !== "bonus" || m.subType !== "initiative") continue;
+		init += m.value ?? 0;
+		if (m.statId != null) init += Math.floor(((allStats[m.statId] ?? 10) - 10) / 2);
+	}
+	return init;
+}
+
+// ─── Which features to show ───────────────────────────────────────────────────
+
+// D&D Beyond uses "feats" internally to wire up things that aren't feats. These tags
+// mark them, and its own sheet leaves them out of the feat list. Every character gets
+// e.g. "Dark Bargain" (The Crooked Moon) whenever that book is enabled for them.
+const INTERNAL_FEAT_TAGS = ["__DISGUISE_FEAT", "__INITIAL_ASI"];
+
+export function getVisibleFeats(char: DdbCharacter): DdbFeat[] {
+	return (char.feats ?? []).filter(
+		(f) => !(f.definition?.categories ?? []).some((c) => INTERNAL_FEAT_TAGS.includes(c.tagName ?? ""))
+	);
+}
+
+// Character-creation bookkeeping: the note and sheet already show these as stats.
+const CHARGEN_TRAITS = ["Ability Score Increases", "Creature Type", "Languages", "Size", "Speed"];
+
+export function getVisibleRacialTraits(char: DdbCharacter): DdbRacialTrait[] {
+	return (char.race?.racialTraits ?? []).filter(
+		(t) => !t.definition?.hideInSheet && !CHARGEN_TRAITS.includes(t.definition?.name ?? "")
+	);
+}
+
+// classFeatures lists every level of the class, so cap it at the character's level.
+// Subclass features can show up in both lists; "Core X Traits" is the class's
+// proficiency table, not a feature.
+export function getClassFeatures(cls: DdbClass): DdbDefinition[] {
+	const level = cls.level ?? 0;
+	const seen = new Set<string>();
+	const all: DdbDefinition[] = [
+		...(cls.classFeatures ?? []).map((f) => f.definition ?? {}),
+		...(cls.subclassDefinition?.classFeatures ?? []),
+	];
+	return all
+		.filter((def) => {
+			if (!def.name || def.hideInSheet || (def.requiredLevel ?? 0) > level) return false;
+			if (/^Core .+ Traits$/.test(def.name) || seen.has(def.name)) return false;
+			seen.add(def.name);
+			return true;
+		})
+		.sort((a, b) => (a.requiredLevel ?? 0) - (b.requiredLevel ?? 0));
+}
+
+// ─── HP state ─────────────────────────────────────────────────────────────────
+
+// State for a tracker rendered from a note. Local changes survive re-renders, but
+// when the note's own values changed since we last read them, the note wins.
+export function resolveHPState(raw: string | undefined, maxHp: number, noteCurrent: number, noteTemp: number): HPState {
+	const fresh: HPState = { max: maxHp, current: noteCurrent, temp: noteTemp, dsS: 0, dsF: 0, log: [], noteCurrent, noteTemp };
+	if (!raw) return fresh;
+	let saved: HPState;
+	try {
+		saved = JSON.parse(raw) as HPState;
+	} catch {
+		return fresh;
+	}
+	if (saved.noteCurrent == null) return { ...saved, max: maxHp, noteCurrent, noteTemp };
+	if (saved.noteCurrent !== noteCurrent || saved.noteTemp !== noteTemp) {
+		return { ...fresh, dsS: saved.dsS, dsF: saved.dsF, log: saved.log ?? [] };
+	}
+	return { ...saved, max: maxHp };
+}
+
+// State right after pulling a character from D&D Beyond: its numbers replace whatever
+// the local tracker held, which is what pressing Refresh asks for.
+export function syncedHPState(raw: string | undefined, char: DdbCharacter, stats: Record<string, number>, stamp: string): HPState {
+	const hp = calcHP(char, stats.con, calcLevel(char.classes ?? []), getAllModifiers(char));
+	let log: string[] = [];
+	let changed = false;
+	try {
+		if (raw) {
+			const prev = JSON.parse(raw) as HPState;
+			log = prev.log ?? [];
+			changed = prev.current !== hp.current || prev.temp !== hp.temp;
+		}
+	} catch { /* unreadable state: start over */ }
+	if (changed) log = [`[${stamp}] 🔄 D&D Beyond → ${hp.current} / ${hp.max} HP`, ...log].slice(0, 20);
+	return {
+		max: hp.max,
+		current: hp.current,
+		temp: hp.temp,
+		dsS: char.deathSaves?.successCount ?? 0,
+		dsF: char.deathSaves?.failCount ?? 0,
+		log,
+		noteCurrent: hp.current,
+		noteTemp: hp.temp,
+	};
 }
 
 export function alignmentName(id: number): string {
@@ -422,6 +572,8 @@ export function buildMarkdown(
 	const rawStatsById: Record<number, number> = { 1: rawStats.str, 2: rawStats.dex, 3: rawStats.con, 4: rawStats.int, 5: rawStats.wis, 6: rawStats.cha };
 	const hp = calcHP(char, rawStats.con, totalLevel, allModifiers);
 	const ac = calcAC(char, rawStats.dex, rawStatsById, allModifiers);
+	const speed = calcSpeed(char, allModifiers);
+	const initiative = calcInitiative(rawStats.dex, rawStatsById, allModifiers);
 
 	const raceName: string = char.race?.fullName ?? char.race?.baseName ?? "Unknown Race";
 	const classString = classes
@@ -439,19 +591,19 @@ export function buildMarkdown(
 
 	// ── YAML Front Matter ───────────────────────────────────────────────────
 	let md = `---
-name: "${char.name ?? ""}"
-race: "${raceName}"
-class: "${classString}"
+name: ${JSON.stringify(char.name ?? "")}
+race: ${JSON.stringify(raceName)}
+class: ${JSON.stringify(classString)}
 level: ${totalLevel}
-background: "${background}"
-alignment: "${alignment}"
+background: ${JSON.stringify(background)}
+alignment: ${JSON.stringify(alignment)}
 xp: ${char.currentXp ?? 0}
 hp: ${hp.max}
-modifier: ${Math.floor((rawStats.dex - 10) / 2)}
+modifier: ${initiative}
 hp_current: ${hp.current}
 hp_temp: ${hp.temp}
 ac: ${ac}
-speed: ${char.race?.weightSpeeds?.normal?.walk ?? 30}
+speed: ${speed}
 proficiency_bonus: ${pb}
 str: ${rawStats.str}
 dex: ${rawStats.dex}
@@ -481,7 +633,7 @@ dndbeyond_id: ${char.id}
 	md += `## Core Stats\n\n`;
 	md += `| HP | AC | Speed | Initiative | Proficiency Bonus |\n`;
 	md += `|:---:|:---:|:---:|:---:|:---:|\n`;
-	md += `| ${hp.current} / ${hp.max}${hp.temp > 0 ? ` (+${hp.temp} temp)` : ""} | ${ac} | ${char.race?.weightSpeeds?.normal?.walk ?? 30} ft | ${modStr(rawStats.dex)} | +${pb} |\n\n`;
+	md += `| ${hp.current} / ${hp.max}${hp.temp > 0 ? ` (+${hp.temp} temp)` : ""} | ${ac} | ${speed} ft | ${initiative >= 0 ? "+" : ""}${initiative} | +${pb} |\n\n`;
 
 	// ── Ability Scores ──────────────────────────────────────────────────────
 	md += `## Ability Scores\n\n`;
@@ -715,7 +867,18 @@ export function buildActionsSection(actions: CharacterAction[]): string {
 export function buildFeatures(char: DdbCharacter): string {
 	let md = `## Features & Traits\n\n`;
 
-	const raceTraits: DdbRacialTrait[] = char.race?.racialTraits ?? [];
+	for (const cls of char.classes ?? []) {
+		const features = getClassFeatures(cls);
+		if (!features.length) continue;
+		md += `### ${cls.definition?.name ?? "Class"} Features\n\n`;
+		for (const def of features) {
+			md += `**${def.name ?? ""}**\n`;
+			if (def.description) md += `${stripHtml(def.description)}\n`;
+			md += "\n";
+		}
+	}
+
+	const raceTraits = getVisibleRacialTraits(char);
 	if (raceTraits.length) {
 		md += `### Racial Traits\n\n`;
 		for (const trait of raceTraits) {
@@ -727,7 +890,7 @@ export function buildFeatures(char: DdbCharacter): string {
 		}
 	}
 
-	const feats: DdbFeat[] = char.feats ?? [];
+	const feats = getVisibleFeats(char);
 	if (feats.length) {
 		md += `### Feats\n\n`;
 		for (const feat of feats) {

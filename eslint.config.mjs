@@ -10,6 +10,7 @@ export default [
     ignores: [
       "main.js",
       "node_modules/**",
+      "tests/**",
       "eslint.config.mjs",
       "esbuild.config.mjs",
       "version-bump.mjs",

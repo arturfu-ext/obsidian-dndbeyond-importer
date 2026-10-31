@@ -1,11 +1,10 @@
 {
-  "id": "dndbeyond-importer",
-  "name": "DnD Beyond Importer",
-  "version": "1.1.4",
+  "id": "dndbeyond-sync",
+  "name": "D&D Beyond Sync",
+  "version": "2.0.0",
   "minAppVersion": "1.12.0",
-  "description": "Import public D&D Beyond characters as beautifully formatted notes into your vault.",
-  "author": "Jktaisa",
-  "authorUrl": "https://github.com/Webcreator3478",
-  "fundingUrl": "https://ko-fi.com/jktaisa",
+  "description": "Sync D&D Beyond characters, public or private, into formatted notes in your vault.",
+  "author": "Artur Furmańczyk, based on DnD Beyond Importer by Jktaisa",
+  "authorUrl": "https://github.com/arturfu-ext/obsidian-dndbeyond-importer",
   "isDesktopOnly": false
 }

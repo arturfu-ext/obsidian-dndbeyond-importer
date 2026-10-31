@@ -1,27 +1,30 @@
 import {
 	App,
+	debounce,
+	MarkdownPostProcessorContext,
+	MarkdownRenderChild,
 	Modal,
 	Notice,
 	normalizePath,
 	Plugin,
 	PluginSettingTab,
 	requestUrl,
+	SecretComponent,
 	Setting,
 	TFile,
 } from "obsidian";
+import { DdbClient, HttpClient } from "./src/ddb-client";
 
 import {
 	DnDBeyondImporterSettings,
 	HPState,
 	DiceRoll,
 	DdbSpell,
-	DdbFeat,
 	DdbClass,
 	DdbSpellSlot,
 	DdbCharacter,
 	DdbApiResponse,
 	DEFAULT_SETTINGS,
-	modStr,
 	profBonus,
 	getAllModifiers,
 	AdvState,
@@ -29,6 +32,13 @@ import {
 	calcHP,
 	calcLevel,
 	calcAC,
+	calcInitiative,
+	calcSpeed,
+	getClassFeatures,
+	getVisibleFeats,
+	getVisibleRacialTraits,
+	resolveHPState,
+	syncedHPState,
 	stripHtml,
 	extractCharacterId,
 	computeRawStats,
@@ -55,7 +65,7 @@ class ImportModal extends Modal {
 		contentEl.empty();
 		contentEl.createEl("h2", { text: "Import D&D Beyond Character" });
 		contentEl.createEl("p", {
-			text: "Paste the character URL or numeric ID. The character must be set to Public on D&D Beyond.",
+			text: "Paste the character URL or numeric ID. Private sheets need your D&D Beyond cookie in the plugin settings; public sheets work without it.",
 			cls: "setting-item-description",
 		});
 
@@ -554,6 +564,7 @@ class FullCharacterSheetModal extends Modal {
 		pluginState: Map<string, string>;
 		hpTracking: Map<string, { maxHp: number; currentHp: number; tempHp: number }>;
 		pluginSettings: { fiveEtoolsEnabled: boolean; fiveEtoolsBaseUrl: string };
+		notifyHpChanged: (charId: string) => void;
 	};
 	char: DdbCharacter;
 	stats: Record<string, number>;
@@ -652,21 +663,22 @@ class FullCharacterSheetModal extends Modal {
 		const conScore = this.stats["con"] ?? 10;
 		const totalLevel = calcLevel(this.char.classes ?? []);
 		const allMods = getAllModifiers(this.char);
+		const hp = calcHP(this.char, conScore, totalLevel, allMods);
 		try {
 			const raw = this.plugin.pluginState.get(key);
 			if (raw) {
 				const s = JSON.parse(raw) as HPState;
-				const hp = calcHP(this.char, conScore, totalLevel, allMods);
 				s.max = hp.max;
 				return s;
 			}
 		} catch { /* */ }
-		const hp = calcHP(this.char, conScore, totalLevel, allMods);
+		// No noteCurrent yet: the tracker widget stamps it when it next renders.
 		return { max: hp.max, current: hp.current, temp: hp.temp, dsS: 0, dsF: 0, log: [] };
 	}
 
 	private saveHP(s: HPState): void {
 		this.plugin.pluginState.set(`dnd-hp-${this.char.id}`, JSON.stringify(s));
+		this.plugin.notifyHpChanged(String(this.char.id));
 	}
 
 	// ── Section builders ─────────────────────────────────────────────────────
@@ -736,8 +748,8 @@ class FullCharacterSheetModal extends Modal {
 		const sheetAllMods = getAllModifiers(char);
 		const sheetStatsById: Record<number, number> = { 1: stats.str, 2: stats.dex, 3: stats.con, 4: stats.int, 5: stats.wis, 6: stats.cha };
 		const ac = calcAC(char, stats.dex, sheetStatsById, sheetAllMods);
-		const speed = char.race?.weightSpeeds?.normal?.walk ?? 30;
-		const initMod = this.mod(stats.dex);
+		const speed = calcSpeed(char, sheetAllMods);
+		const initiative = calcInitiative(stats.dex, sheetStatsById, sheetAllMods);
 		const hpState = this.loadHP();
 
 		const allMods = getAllModifiers(char);
@@ -786,7 +798,7 @@ class FullCharacterSheetModal extends Modal {
 		this.pill(coreRow, "HP", `${hpState.current}/${hpState.max}`, hpState.temp > 0 ? `+${hpState.temp} temp` : undefined);
 		this.pill(coreRow, "AC", String(ac));
 		this.pill(coreRow, "Speed", `${speed} ft`);
-		this.pill(coreRow, "Initiative", this.modStr(initMod));
+		this.pill(coreRow, "Initiative", this.modStr(initiative));
 		this.pill(coreRow, "Prof. Bonus", `+${pb}`);
 
 		// ════════════════════════════════════════════════════════════════════
@@ -1259,14 +1271,11 @@ class FullCharacterSheetModal extends Modal {
 		// ════════════════════════════════════════════════════════════════════
 		// FEATURES & TRAITS (expandable, with 5etools lookup)
 		// ════════════════════════════════════════════════════════════════════
-		const racialTraits = char.race?.racialTraits ?? [];
-		const feats: DdbFeat[] = char.feats ?? [];
+		const racialTraits = getVisibleRacialTraits(char);
+		const feats = getVisibleFeats(char);
 
-		if (racialTraits.length || feats.length) {
-			const featSection = this.sectionEl(mainCol, "Features & Traits");
-
-			const makeFeat = (name: string, rawDesc: string | undefined, fetchType: "classfeature" | "races") => {
-				const card = featSection.createDiv();
+		const makeFeat = (parent: HTMLElement, name: string, rawDesc: string | undefined, fetchType: "classfeature" | "races") => {
+				const card = parent.createDiv();
 				card.addClass("dndbi-cs-feat-card");
 				const hdr = card.createDiv();
 				hdr.addClass("dndbi-cs-feat-hdr");
@@ -1316,11 +1325,13 @@ class FullCharacterSheetModal extends Modal {
 				}
 			};
 
+		if (racialTraits.length || feats.length) {
+			const featSection = this.sectionEl(mainCol, "Features & Traits");
 			for (const t of racialTraits) {
-				if (t.definition?.name) makeFeat(t.definition.name, t.definition.description, "races");
+				if (t.definition?.name) makeFeat(featSection, t.definition.name, t.definition.description, "races");
 			}
 			for (const f of feats) {
-				if (f.definition?.name) makeFeat(f.definition.name, f.definition.description, "classfeature");
+				if (f.definition?.name) makeFeat(featSection, f.definition.name, f.definition.description, "classfeature");
 			}
 		}
 
@@ -1332,6 +1343,9 @@ class FullCharacterSheetModal extends Modal {
 			const className = cls.definition?.name ?? "Unknown";
 			const clsHdr = classFeatureSection.createDiv(); clsHdr.setText(`${className} (Level ${cls.level ?? 0})`);
 			clsHdr.addClass("dndbi-cs-cls-hdr");
+			for (const def of getClassFeatures(cls)) {
+				if (def.name) makeFeat(classFeatureSection, def.name, def.description, "classfeature");
+			}
 		}
 
 		// ════════════════════════════════════════════════════════════════════
@@ -1431,10 +1445,12 @@ class DnDBeyondSettingTab extends PluginSettingTab {
 			includeEquipment: boolean;
 			includeFeatures: boolean;
 			includeBackstory: boolean;
+			cobaltSecret: string;
 			fiveEtoolsEnabled: boolean;
 			fiveEtoolsBaseUrl: string;
 		};
 		saveSettings: () => Promise<void>;
+		ddb: DdbClient;
 	};
 
 	constructor(app: App, plugin: DnDBeyondSettingTab["plugin"]) {
@@ -1452,6 +1468,28 @@ class DnDBeyondSettingTab extends PluginSettingTab {
 	// manually with display() — see the pitfall note in the migration guide.
 	getSettingDefinitions() {
 		return [
+			{
+				name: "D&D Beyond cookie",
+				desc: "Lets the plugin read your private sheets. Log in to dndbeyond.com, open your browser's developer tools, find the CobaltSession cookie under Application (or Storage), and save its value as a secret here. It stays in Obsidian's secret storage, outside the vault, and only goes to D&D Beyond. It logs in as you, so don't share it. Without it, only public sheets can be read.",
+				render: (setting: Setting) => {
+					setting.addComponent((el) =>
+						new SecretComponent(this.app, el)
+							.setValue(this.plugin.pluginSettings.cobaltSecret)
+							.onChange((value) => {
+								this.plugin.pluginSettings.cobaltSecret = value ?? "";
+								void this.plugin.saveSettings();
+							})
+					);
+					setting.addButton((btn) =>
+						btn.setButtonText("Test").onClick(() => {
+							this.plugin.ddb
+								.describeAccount()
+								.then((who) => new Notice(`✅ Connected to D&D Beyond as ${who}.`, 5000))
+								.catch((e: unknown) => new Notice(`❌ ${e instanceof Error ? e.message : String(e)}`, 7000));
+						})
+					);
+				},
+			},
 			{
 				name: "Output folder",
 				desc: "Vault folder where character notes are saved (leave blank for vault root).",
@@ -1570,17 +1608,57 @@ class DnDBeyondSettingTab extends PluginSettingTab {
 // touches that API. Renaming sidesteps the false positive; functionality is
 // unchanged. Every `this.plugin.settings` reference in the modal classes above
 // was updated to `this.plugin.pluginSettings` to match.
+// A Map that reports real changes, so callers can keep using plain get/set.
+class PluginState extends Map<string, string> {
+	constructor(private onChange: () => void) {
+		super();
+	}
+
+	set(key: string, value: string): this {
+		const changed = this.get(key) !== value;
+		super.set(key, value);
+		if (changed) this.onChange();
+		return this;
+	}
+
+	restore(saved: Record<string, string>): void {
+		for (const key of Object.keys(saved)) super.set(key, saved[key]);
+	}
+}
+
+// The HTTP layer for DdbClient. throw: false because DdbClient reads the status
+// itself, and non-JSON bodies are normal on errors.
+const obsidianHttp: HttpClient = async (req) => {
+	const resp = await requestUrl({ ...req, throw: false });
+	let json: unknown = null;
+	try {
+		json = resp.json;
+	} catch { /* not JSON */ }
+	return { status: resp.status, json };
+};
+
 export default class DnDBeyondImporterPlugin extends Plugin {
 	pluginSettings!: DnDBeyondImporterSettings;
-	charCache: Map<string, { char: DdbCharacter; stats: Record<string, number>; pb: number }> = new Map();
+	// partial: rebuilt from frontmatter after a restart, so no spells, items or features.
+	charCache: Map<string, { char: DdbCharacter; stats: Record<string, number>; pb: number; partial?: boolean }> = new Map();
 	hpTracking: Map<string, { maxHp: number; currentHp: number; tempHp: number }> = new Map();
 	// Backs the HP tracker widget, spell-slot pips, equipment toggles, and session
-	// notes in the Interactive Character Sheet — replaces sessionStorage (see v1.1.1).
-	pluginState: Map<string, string> = new Map();
+	// notes in the Interactive Character Sheet. Saved to data.json so it survives
+	// restarts.
+	pluginState: PluginState = new PluginState(() => this.saveStateSoon());
+	// Live HP tracker widgets per character, so a refresh can repaint them even when
+	// the note text didn't change and Obsidian has no reason to re-render.
+	hpWidgets: Map<string, Set<() => void>> = new Map();
 	rollHistory: DiceRoll[] = [];
+	ddb!: DdbClient;
+	private saveStateSoon = debounce(() => void this.saveSettings(), 1000, true);
 
 	async onload() {
 		await this.loadSettings();
+		this.ddb = new DdbClient(obsidianHttp, () => {
+			const name = this.pluginSettings.cobaltSecret;
+			return name ? this.app.secretStorage.getSecret(name) : null;
+		});
 
 		// ── Restore charCache from vault notes after an Obsidian restart ──────────
 		// charCache is in-memory only, so it's empty on every startup. Without this,
@@ -1603,6 +1681,7 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 					null;
 				if (id === null) continue;
 				if (this.charCache.has(id)) continue; // already populated (e.g. just imported)
+				const maxHp = Number(fm["hp"] ?? 10);
 				// Rebuild a minimal DdbCharacter from the frontmatter values so the
 				// interactive sheet and HP tracker have all the numbers they need.
 				const stats: Record<string, number> = {
@@ -1622,8 +1701,8 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 					id: Number(id),
 					name: (fm["name"] as string | undefined) ?? "",
 					avatarUrl: fm["avatar_url"] as string | undefined,
-					baseHitPoints: Number(fm["hp_max"] ?? 10),
-					removedHitPoints: Number(fm["hp_max"] ?? 10) - Number(fm["hp_current"] ?? Number(fm["hp_max"] ?? 10)),
+					overrideHitPoints: maxHp,
+					removedHitPoints: maxHp - Number(fm["hp_current"] ?? maxHp),
 					temporaryHitPoints: Number(fm["hp_temp"] ?? 0),
 					currentXp: Number(fm["xp"] ?? 0),
 					stats: [
@@ -1659,7 +1738,7 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 					feats: [],
 					classSpells: [],
 				};
-				this.charCache.set(id, { char, stats, pb });
+				this.charCache.set(id, { char, stats, pb, partial: true });
 			}
 		});
 
@@ -1684,6 +1763,12 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "refresh-all-characters",
+			name: "Refresh all characters from D&D Beyond",
+			callback: () => void this.refreshAllCharacters(),
+		});
+
+		this.addCommand({
 			id: "open-dice-roller",
 			name: "Open Dice Roller",
 			callback: () => {
@@ -1705,7 +1790,7 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 		});
 
 		// ── HP Tracker Code Block Processor ───────────────────────────────────────
-		this.registerMarkdownCodeBlockProcessor("dnd-hp-tracker", (source: string, el: HTMLElement) => {
+		this.registerMarkdownCodeBlockProcessor("dnd-hp-tracker", (source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) => {
 			const params: Record<string, string> = {};
 			for (const line of source.split("\n")) {
 				const parts = line.split(":");
@@ -1719,13 +1804,7 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 			const initTmp = parseInt(params["tempHp"]    ?? "0",  10);
 			const STORE_KEY = `dnd-hp-${charId}`;
 
-			const loadState = (): HPState => {
-				try {
-					const raw = this.pluginState.get(STORE_KEY);
-					if (raw) { const s = JSON.parse(raw) as HPState; s.max = maxHp; return s; }
-				} catch { /* */ }
-				return { max: maxHp, current: initCur, temp: initTmp, dsS: 0, dsF: 0, log: [] };
-			};
+			const loadState = (): HPState => resolveHPState(this.pluginState.get(STORE_KEY), maxHp, initCur, initTmp);
 			const saveState = (s: HPState) => this.pluginState.set(STORE_KEY, JSON.stringify(s));
 			const state = loadState();
 
@@ -1857,6 +1936,20 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 			const logEl = logSection.createDiv({ cls: "dndbi-hp-log-list" });
 
 			render();
+
+			// Repaint from the shared state when a refresh or the sheet modal changes it.
+			const repaint = () => {
+				const latest = this.pluginState.get(STORE_KEY);
+				if (latest) Object.assign(state, JSON.parse(latest) as HPState);
+				tmpInput.value = String(state.temp);
+				render();
+			};
+			const widgets = this.hpWidgets.get(charId) ?? new Set<() => void>();
+			this.hpWidgets.set(charId, widgets);
+			widgets.add(repaint);
+			const lifetime = new MarkdownRenderChild(el);
+			lifetime.register(() => widgets.delete(repaint));
+			ctx.addChild(lifetime);
 		});
 
 		// ── Character Sheet Launcher Code Block Processor ───────────────────────
@@ -1880,12 +1973,7 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 					new Notice("This note has no D&D Beyond character ID.", 3000);
 					return;
 				}
-				const cached = this.charCache.get(charId);
-				if (!cached) {
-					new Notice("Import the character first so the sheet has data to display.", 3000);
-					return;
-				}
-				new FullCharacterSheetModal(this.app, this, cached.char, cached.stats, cached.pb).open();
+				void this.openSheet(charId);
 			});
 
 			const refreshBtn = row.createEl("button", { cls: "dndbi-refresh-btn" });
@@ -1923,49 +2011,114 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const loaded = (await this.loadData()) as Partial<DnDBeyondImporterSettings> | null;
-		this.pluginSettings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+		const loaded = (await this.loadData()) as (Partial<DnDBeyondImporterSettings> & { state?: Record<string, string> }) | null;
+		const { state, ...settings } = loaded ?? {};
+		this.pluginSettings = Object.assign({}, DEFAULT_SETTINGS, settings);
+		this.pluginState.restore(state ?? {});
 	}
 
 	async saveSettings() {
-		await this.saveData(this.pluginSettings);
+		const state: Record<string, string> = {};
+		this.pluginState.forEach((value, key) => { state[key] = value; });
+		await this.saveData({ ...this.pluginSettings, state });
+	}
+
+	notifyHpChanged(charId: string): void {
+		this.hpWidgets.get(charId)?.forEach((repaint) => repaint());
+	}
+
+	private characterFiles(): { file: TFile; id: string }[] {
+		const found: { file: TFile; id: string }[] = [];
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const id: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.["dndbeyond_id"];
+			if (typeof id === "number" || typeof id === "string") found.push({ file, id: String(id) });
+		}
+		return found;
+	}
+
+	private cacheCharacter(char: DdbCharacter): void {
+		this.charCache.set(String(char.id), {
+			char,
+			stats: computeRawStats(char),
+			pb: profBonus(calcLevel(char.classes ?? [])),
+		});
+	}
+
+	// After a restart we only have what frontmatter could hold, so fetch the real
+	// character for the sheet. Offline, the partial one still beats nothing.
+	private async openSheet(charId: string): Promise<void> {
+		let cached = this.charCache.get(charId);
+		if (!cached || cached.partial) {
+			try {
+				const { data } = await this.ddb.fetchCharacter(charId);
+				if (data.data) this.cacheCharacter(data.data);
+				cached = this.charCache.get(charId);
+			} catch (e) {
+				new Notice(`⚠️ ${e instanceof Error ? e.message : String(e)}`, 6000);
+			}
+		}
+		if (!cached) return;
+		new FullCharacterSheetModal(this.app, this, cached.char, cached.stats, cached.pb).open();
+	}
+
+	private async refreshAllCharacters(): Promise<void> {
+		const characters = this.characterFiles();
+		if (!characters.length) {
+			new Notice("No imported D&D Beyond characters found in this vault.", 4000);
+			return;
+		}
+		const failed: string[] = [];
+		for (const { file, id } of characters) {
+			try {
+				await this.importCharacter(id, true);
+			} catch (e) {
+				failed.push(file.basename);
+				console.error("[DnD Beyond Importer]", e);
+			}
+		}
+		const done = characters.length - failed.length;
+		new Notice(
+			failed.length
+				? `⚠️ Refreshed ${done} of ${characters.length} characters. Failed: ${failed.join(", ")}. See the console for details.`
+				: `✅ Refreshed ${done} characters from D&D Beyond.`,
+			6000
+		);
 	}
 
 	// Fetches a character from D&D Beyond, builds/updates its Markdown note, and
-	// refreshes charCache. Re-throws on failure (after showing a Notice) so callers
-	// — e.g. the refresh button on the sheet launcher — can detect and react to it.
-	async importCharacter(idOrUrl: string): Promise<void> {
+	// refreshes charCache and the HP trackers. Re-throws on failure (after showing a
+	// Notice unless quiet) so callers — e.g. the refresh button on the sheet launcher —
+	// can detect and react to it.
+	async importCharacter(idOrUrl: string, quiet = false): Promise<void> {
+		const notify = (msg: string, ms: number) => {
+			if (!quiet) new Notice(msg, ms);
+		};
 		const id = extractCharacterId(idOrUrl);
 		if (!id) {
-			new Notice("Couldn't find a D&D Beyond character ID in that input.", 4000);
+			notify("Couldn't find a D&D Beyond character ID in that input.", 4000);
 			throw new Error("Invalid D&D Beyond character URL or ID.");
 		}
 
 		let data: DdbApiResponse;
 		try {
-			const resp = await requestUrl({
-				url: `https://character-service.dndbeyond.com/character/v5/character/${id}`,
-				headers: { Accept: "application/json" },
-			});
-			data = resp.json as DdbApiResponse;
+			const fetched = await this.ddb.fetchCharacter(id);
+			data = fetched.data;
+			if (fetched.warning) new Notice(`⚠️ ${fetched.warning}`, 7000);
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			new Notice(`❌ Couldn't fetch character ${id}. Make sure the sheet is set to Public on D&D Beyond.`, 5000);
+			notify(`❌ ${msg}`, 8000);
 			throw new Error(`Failed to fetch D&D Beyond character ${id}: ${msg}`);
 		}
 
-		const char = data?.data;
-		if (!char) {
-			new Notice("❌ Unexpected response from D&D Beyond. Is the character set to Public?", 5000);
-			throw new Error("Unexpected D&D Beyond API response structure.");
-		}
+		const char = data.data;
+		if (!char) throw new Error("Unexpected D&D Beyond API response structure.");
 
 		let markdown: string;
 		try {
 			markdown = buildMarkdown(data, this.pluginSettings);
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			new Notice(`❌ Failed to build character note: ${msg}`, 5000);
+			notify(`❌ Failed to build character note: ${msg}`, 5000);
 			throw e;
 		}
 
@@ -1983,13 +2136,13 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 
 		// Re-import support: match on dndbeyond_id in front matter, not file name,
 		// so renaming the note doesn't break future refreshes.
-		const existing: TFile | undefined = this.app.vault.getMarkdownFiles().find(
-			(f: TFile) => {
-				const fm: Record<string, unknown> | undefined =
-					this.app.metadataCache.getFileCache(f)?.frontmatter;
-				return fm?.["dndbeyond_id"] === char.id;
-			}
-		);
+		const existing = this.characterFiles().find((c) => c.id === String(char.id))?.file;
+
+		// Write the HP state before the note so the re-render triggered by the write
+		// already agrees with it.
+		const key = `dnd-hp-${char.id}`;
+		const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+		this.pluginState.set(key, JSON.stringify(syncedHPState(this.pluginState.get(key), char, computeRawStats(char), stamp)));
 
 		try {
 			if (existing) {
@@ -2005,16 +2158,13 @@ export default class DnDBeyondImporterPlugin extends Plugin {
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			new Notice(`❌ Failed to write character note: ${msg}`, 5000);
+			notify(`❌ Failed to write character note: ${msg}`, 5000);
 			throw e;
 		}
 
-		this.charCache.set(String(char.id), {
-			char,
-			stats: computeRawStats(char),
-			pb: profBonus(calcLevel(char.classes ?? [])),
-		});
+		this.cacheCharacter(char);
+		this.notifyHpChanged(String(char.id));
 
-		new Notice(`✅ Imported ${char.name ?? "character"}.`, 3000);
+		notify(`✅ Imported ${char.name ?? "character"}.`, 3000);
 	}
 }

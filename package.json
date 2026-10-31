@@ -1,24 +1,25 @@
 {
-  "name": "obsidian-js-runner",
-  "version": "1.0.0",
-  "description": "Obsidian plugin to run JavaScript inside Markdown notes",
+  "name": "obsidian-dndbeyond-sync",
+  "version": "2.0.0",
+  "description": "Sync D&D Beyond characters, public or private, into Obsidian notes",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "version": "node version-bump.mjs && git add manifest.json versions.json",
+    "test": "vitest run",
     "lint": "eslint ."
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@eslint/json": "^0.14.0",
-    "@types/node": "^16.11.6",
+    "@types/node": "^26.6.6",
     "esbuild": "^0.28.1",
     "eslint": "^9.0.0",
     "eslint-plugin-obsidianmd": "^0.4.0",
     "obsidian": "latest",
     "tslib": "2.4.0",
     "typescript": "^5.4.5",
-    "typescript-eslint": "^8.0.0"
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^5.0.5"
   }
 }
